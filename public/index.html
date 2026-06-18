@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>FFA Guns</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main id="game-shell">
+      <canvas id="game"></canvas>
+
+      <section id="loadout" class="overlay">
+        <div class="loadout-panel">
+          <p class="eyebrow">FFA Guns</p>
+          <h1>Choose your weapon</h1>
+          <input id="player-name" maxlength="18" placeholder="Name" autocomplete="off">
+          <div class="weapon-grid">
+            <button class="weapon-card" data-weapon="assault">
+              <span class="weapon-art assault-art"></span>
+              <strong>Assault Rifle</strong>
+              <small>8 dmg, 0.1s auto, 15 ammo</small>
+            </button>
+            <button class="weapon-card" data-weapon="burst">
+              <span class="weapon-art burst-art"></span>
+              <strong>Burst Rifle</strong>
+              <small>3-round burst, 14 dmg, 12 ammo</small>
+            </button>
+            <button class="weapon-card" data-weapon="sniper">
+              <span class="weapon-art sniper-art"></span>
+              <strong>Sniper</strong>
+              <small>40 body dmg, 100 headshot, 4 ammo</small>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <div id="hud" class="hidden">
+        <div id="top-bar">
+          <div id="status">
+            <span id="hp">100 HP</span>
+            <span id="ammo">0 / 0</span>
+            <span id="reload"></span>
+          </div>
+          <div id="reveal-pill">REVEAL</div>
+        </div>
+
+        <div id="crosshair" aria-hidden="true">
+          <i></i><i></i><i></i><i></i>
+        </div>
+        <div id="scope" aria-hidden="true"></div>
+
+        <div id="damage-vignette"></div>
+        <div id="hitmarker">x</div>
+
+        <aside id="scoreboard"></aside>
+        <aside id="feed"></aside>
+        <canvas id="minimap" width="170" height="170"></canvas>
+
+        <section id="assist-panel">
+          <label>
+            <input id="aim-assist" type="checkbox">
+            <span>Aim assist</span>
+          </label>
+          <label>
+            <input id="auto-aim" type="checkbox">
+            <span>Auto aim</span>
+          </label>
+          <label class="slider-label">
+            <span>Intensity</span>
+            <input id="assist-intensity" type="range" min="0" max="100" value="45">
+          </label>
+        </section>
+
+        <div id="help">
+          <span>WASD</span>
+          <span>Mouse</span>
+          <span>Click</span>
+          <span>R</span>
+          <span>Q/E aim</span>
+          <span>-/= power</span>
+        </div>
+
+        <button id="resume" class="hidden">Click to resume</button>
+      </div>
+    </main>
+
+    <script type="module" src="./game.js"></script>
+  </body>
+</html>
