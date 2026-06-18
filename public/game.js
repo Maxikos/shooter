@@ -26,6 +26,11 @@ const SCOPE_FOV = 32;
 const CHUNK_SIZE = 18;
 const PLAYER_HEIGHT = 1.7;
 const EYE_HEIGHT = 1.45;
+const LOCAL_WEAPONS = {
+  assault: { id: "assault", damage: 8, cooldown: 0.1, magazine: 15, reload: 1.34, headshot: 1.5, speed: 0.9, range: 30, dropStart: 10, dropDamageStart: 7.9, dropDamageEnd: 2, burst: 1, burstGap: 0 },
+  burst: { id: "burst", damage: 14, cooldown: 0.6, magazine: 12, reload: 0.92, headshot: 1, speed: 0.95, range: 45, dropStart: 15, dropDamageStart: 13.9, dropDamageEnd: 3.5, burst: 3, burstGap: 0.15 },
+  sniper: { id: "sniper", damage: 40, cooldown: 1.6, magazine: 4, reload: 2.5, headshot: 2.5, speed: 1, range: 120, dropStart: null, dropDamageStart: null, dropDamageEnd: null, burst: 1, burstGap: 0 }
+};
 
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.7));
@@ -86,6 +91,8 @@ const state = {
   ws: null,
   connected: false,
   joined: false,
+  offline: false,
+  pendingJoin: false,
   selfId: null,
   seed: 1,
   worldRadius: 52,
@@ -112,6 +119,11 @@ const state = {
   weaponKick: 0,
   reloadAnim: 0,
   walkPhase: 0,
+  offlineNextShotAt: 0,
+  offlineShots: [],
+  offlineRevealAt: 0,
+  offlineBotGoal: { x: 8, z: 8 },
+  offlineBotThinkAt: 0,
   localPos: new THREE.Vector3(0, EYE_HEIGHT, 0)
 };
 
@@ -251,7 +263,8 @@ function connect() {
 
   ws.addEventListener("close", () => {
     state.connected = false;
-    pushFeed("Game server unavailable. Check the multiplayer server URL.");
+    state.offline = true;
+    if (state.pendingJoin && !state.joined) startOfflineMatch();
   });
 
   ws.addEventListener("message", (event) => {
@@ -343,6 +356,11 @@ function handleServerMessage(message) {
 function joinGame() {
   ensureAudio();
   buildWeaponView(state.selectedWeapon);
+  state.pendingJoin = true;
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+    startOfflineMatch();
+    return;
+  }
   send({
     type: "join",
     name: playerNameInput.value || "",
@@ -351,6 +369,10 @@ function joinGame() {
 }
 
 function send(message) {
+  if (state.offline) {
+    if (message.type === "reload") startOfflineReload();
+    return;
+  }
   if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
   state.ws.send(JSON.stringify(message));
 }
@@ -376,6 +398,8 @@ function sendInput() {
   const rawDir = { x: rayDir.x, y: rayDir.y, z: rayDir.z };
   getAssistedAimDirection(rayDir);
 
+  if (state.offline) return;
+
   send({
     type: "input",
     forward: (state.keys.has("keyw") ? 1 : 0) + (state.keys.has("keys") ? -1 : 0),
@@ -390,8 +414,250 @@ function sendInput() {
 
 function sendShot() {
   if (!state.joined) return;
+  if (state.offline) {
+    tryOfflineFire(performance.now());
+    return;
+  }
   getAssistedAimDirection(rayDir);
   send({ type: "shoot", dir: { x: rayDir.x, y: rayDir.y, z: rayDir.z } });
+}
+
+function startOfflineMatch() {
+  if (state.joined) return;
+  state.offline = true;
+  state.joined = true;
+  state.pendingJoin = false;
+  state.selfId = "offline-player";
+  state.weaponDefs = LOCAL_WEAPONS;
+  state.worldRadius = 52;
+
+  const weapon = LOCAL_WEAPONS[state.selectedWeapon] || LOCAL_WEAPONS.assault;
+  const self = makeOfflinePlayer(state.selfId, playerNameInput.value.trim() || "Player", false, 0, 8, weapon.id);
+  const movingBot = makeOfflinePlayer("offline-bot", "Target Bot", true, 8, -8, "assault");
+  const dummy = makeOfflinePlayer("offline-dummy", "Training Dummy", true, -10, -6, "assault");
+  dummy.isTrainingDummy = true;
+  dummy.hp = 300;
+  dummy.maxHp = 300;
+  dummy.color = "#70e1a1";
+
+  state.players.clear();
+  state.players.set(self.id, self);
+  state.players.set(movingBot.id, movingBot);
+  state.players.set(dummy.id, dummy);
+  state.localPos.set(self.x, EYE_HEIGHT, self.z);
+  state.offlineNextShotAt = 0;
+  state.offlineShots.length = 0;
+  state.offlineRevealAt = Date.now() + 10000;
+
+  loadout.classList.add("hidden");
+  hud.classList.remove("hidden");
+  updatePlayers(Array.from(state.players.values()));
+  pushFeed("Training mode active. Multiplayer server is offline.");
+  requestPointerLockSafe();
+  rebuildWorld();
+}
+
+function makeOfflinePlayer(id, name, isBot, x, z, weaponId) {
+  const weapon = LOCAL_WEAPONS[weaponId];
+  return {
+    id,
+    name,
+    isBot,
+    isTrainingDummy: false,
+    color: isBot ? "#f0b94b" : "#4cc9f0",
+    x,
+    z,
+    renderX: x,
+    renderZ: z,
+    yaw: 0,
+    pitch: 0,
+    hp: 100,
+    maxHp: 100,
+    score: 0,
+    deaths: 0,
+    weapon: weapon.id,
+    ammo: weapon.magazine,
+    magazine: weapon.magazine,
+    reloading: false,
+    reloadEnd: 0,
+    deadUntil: 0
+  };
+}
+
+function updateOfflineGame(dt, now) {
+  const self = state.players.get(state.selfId);
+  if (!self) return;
+
+  moveOfflinePlayer(self, dt);
+  updateOfflineBots(dt);
+
+  if (self.reloading && Date.now() >= self.reloadEnd) {
+    const weapon = LOCAL_WEAPONS[self.weapon];
+    self.ammo = weapon.magazine;
+    self.reloading = false;
+    self.reloadEnd = 0;
+  }
+
+  if (state.shooting) tryOfflineFire(now);
+  processOfflineShots(now);
+
+  if (Date.now() >= state.offlineRevealAt) {
+    state.revealUntil = Date.now() + 3000;
+    state.offlineRevealAt = Date.now() + 10000;
+    playReveal();
+  }
+
+  updateSelfHud(self);
+  updateScoreboard();
+}
+
+function moveOfflinePlayer(player, dt) {
+  if (player.hp <= 0) return;
+  const forward = (state.keys.has("keyw") ? 1 : 0) + (state.keys.has("keys") ? -1 : 0);
+  const strafe = (state.keys.has("keyd") ? 1 : 0) + (state.keys.has("keya") ? -1 : 0);
+  const length = Math.hypot(forward, strafe);
+  if (!length) return;
+
+  getRawAimDirection(rayDir);
+  const flatLength = Math.hypot(rayDir.x, rayDir.z) || 1;
+  const fx = rayDir.x / flatLength;
+  const fz = rayDir.z / flatLength;
+  const rx = -fz;
+  const rz = fx;
+  const speed = BASE_SPEED * LOCAL_WEAPONS[player.weapon].speed;
+  player.x += (fx * (forward / length) + rx * (strafe / length)) * speed * dt;
+  player.z += (fz * (forward / length) + rz * (strafe / length)) * speed * dt;
+
+  const distance = Math.hypot(player.x, player.z);
+  const limit = state.worldRadius - 2;
+  if (distance > limit) {
+    player.x *= limit / distance;
+    player.z *= limit / distance;
+  }
+}
+
+function updateOfflineBots(dt) {
+  const now = Date.now();
+  const movingBot = state.players.get("offline-bot");
+  const dummy = state.players.get("offline-dummy");
+
+  for (const bot of [movingBot, dummy]) {
+    if (bot && bot.hp <= 0 && now >= bot.deadUntil) {
+      bot.hp = bot.maxHp;
+      bot.deadUntil = 0;
+    }
+  }
+
+  if (!movingBot || movingBot.hp <= 0) return;
+  if (now >= state.offlineBotThinkAt || Math.hypot(state.offlineBotGoal.x - movingBot.x, state.offlineBotGoal.z - movingBot.z) < 1.5) {
+    const angle = Math.random() * Math.PI * 2;
+    const distance = 7 + Math.random() * 18;
+    state.offlineBotGoal = { x: Math.cos(angle) * distance, z: Math.sin(angle) * distance };
+    state.offlineBotThinkAt = now + 2200;
+  }
+
+  const dx = state.offlineBotGoal.x - movingBot.x;
+  const dz = state.offlineBotGoal.z - movingBot.z;
+  const length = Math.hypot(dx, dz) || 1;
+  movingBot.x += (dx / length) * 1.45 * dt;
+  movingBot.z += (dz / length) * 1.45 * dt;
+  movingBot.yaw = Math.atan2(dx, -dz);
+}
+
+function tryOfflineFire(now) {
+  const self = state.players.get(state.selfId);
+  if (!self || self.hp <= 0 || self.reloading || now < state.offlineNextShotAt) return;
+  const weapon = LOCAL_WEAPONS[self.weapon];
+  if (self.ammo <= 0) {
+    startOfflineReload();
+    return;
+  }
+
+  const shots = Math.min(weapon.burst, self.ammo);
+  self.ammo -= shots;
+  state.offlineNextShotAt = now + weapon.cooldown * 1000;
+  for (let i = 0; i < shots; i += 1) {
+    state.offlineShots.push({ due: now + weapon.burstGap * 1000 * i, weapon: weapon.id });
+  }
+  if (self.ammo <= 0) startOfflineReload();
+}
+
+function startOfflineReload() {
+  const self = state.players.get(state.selfId);
+  if (!self || self.reloading) return;
+  const weapon = LOCAL_WEAPONS[self.weapon];
+  if (self.ammo >= weapon.magazine) return;
+  self.reloading = true;
+  self.reloadEnd = Date.now() + weapon.reload * 1000;
+  state.reloadAnim = 1;
+  playReload(weapon.id);
+}
+
+function processOfflineShots(now) {
+  state.offlineShots.sort((a, b) => a.due - b.due);
+  while (state.offlineShots.length && state.offlineShots[0].due <= now) {
+    const shot = state.offlineShots.shift();
+    resolveOfflineShot(LOCAL_WEAPONS[shot.weapon]);
+  }
+}
+
+function resolveOfflineShot(weapon) {
+  const self = state.players.get(state.selfId);
+  if (!self) return;
+  getAssistedAimDirection(rayDir);
+  const origin = new THREE.Vector3(self.x, EYE_HEIGHT, self.z);
+  let closest = null;
+
+  for (const target of state.players.values()) {
+    if (target.id === self.id || target.hp <= 0) continue;
+    const range = target.isTrainingDummy ? Math.max(weapon.range, 140) : weapon.range;
+    const headDistance = raySphereDistance(origin, rayDir, new THREE.Vector3(target.x, 1.52, target.z), 0.34, range);
+    const bodyDistance = raySphereDistance(origin, rayDir, new THREE.Vector3(target.x, 0.78, target.z), 0.62, range);
+    const distance = headDistance !== null && (bodyDistance === null || headDistance <= bodyDistance) ? headDistance : bodyDistance;
+    if (distance === null || (closest && distance >= closest.distance)) continue;
+    closest = { target, distance, headshot: distance === headDistance };
+  }
+
+  if (!closest) {
+    const to = origin.clone().add(rayDir.clone().multiplyScalar(Math.min(weapon.range, 70)));
+    onShot({ type: "shot", shooterId: self.id, weapon: weapon.id, from: origin, to, hit: false });
+    return;
+  }
+
+  const damageDistance = closest.target.isTrainingDummy ? Math.min(closest.distance, weapon.range) : closest.distance;
+  const damage = calculateOfflineDamage(weapon, damageDistance, closest.headshot);
+  closest.target.hp = clamp(closest.target.hp - damage, 0, closest.target.maxHp);
+  closest.target.lastHitAt = performance.now();
+  const to = origin.clone().add(rayDir.clone().multiplyScalar(closest.distance));
+  onShot({ type: "shot", shooterId: self.id, targetId: closest.target.id, weapon: weapon.id, from: origin, to, hit: true, headshot: closest.headshot, damage });
+
+  if (closest.target.hp <= 0) {
+    self.score += 1;
+    closest.target.deaths += 1;
+    closest.target.deadUntil = Date.now() + 1300;
+    pushFeed(`${self.name} eliminated ${closest.target.name}.`);
+  }
+}
+
+function raySphereDistance(origin, direction, center, radius, range) {
+  const offset = origin.clone().sub(center);
+  const b = offset.dot(direction);
+  const c = offset.lengthSq() - radius * radius;
+  const discriminant = b * b - c;
+  if (discriminant < 0) return null;
+  const root = Math.sqrt(discriminant);
+  const distance = -b - root > 0 ? -b - root : -b + root;
+  return distance > 0 && distance <= range ? distance : null;
+}
+
+function calculateOfflineDamage(weapon, distance, headshot) {
+  let damage = weapon.damage;
+  if (weapon.dropStart !== null && distance > weapon.dropStart) {
+    const t = clamp((distance - weapon.dropStart) / (weapon.range - weapon.dropStart), 0, 1);
+    damage = lerp(weapon.dropDamageStart, weapon.dropDamageEnd, t);
+  }
+  if (headshot) damage *= weapon.headshot;
+  return Math.round(damage * 10) / 10;
 }
 
 function getAssistedAimDirection(out) {
@@ -516,6 +782,7 @@ function update(dt) {
   const now = performance.now();
   const self = state.players.get(state.selfId);
 
+  if (state.offline) updateOfflineGame(dt, now);
   updateAutoAim(self, dt);
   updateCamera(self, dt);
   updateRemotePlayers(dt, now);
@@ -559,7 +826,7 @@ function updateCamera(self, dt) {
     return;
   }
 
-  predictLocalMovement(self, dt);
+  if (!state.offline) predictLocalMovement(self, dt);
   const target = tempVector.set(self.x, EYE_HEIGHT, self.z);
   state.localPos.lerp(target, 1 - Math.pow(0.00002, dt));
   camera.position.copy(state.localPos);
