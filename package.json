@@ -1,0 +1,12 @@
+{
+  "name": "ffa-guns",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A browser-based 3D FFA shooter prototype with multiplayer, procedural map scaling, weapons, SFX, and a test bot.",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -241,8 +241,7 @@ renderer.setAnimationLoop(() => {
 });
 
 function connect() {
-  const protocol = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${protocol}://${location.host}`);
+  const ws = new WebSocket(resolveGameServerUrl());
   state.ws = ws;
 
   ws.addEventListener("open", () => {
@@ -252,13 +251,37 @@ function connect() {
 
   ws.addEventListener("close", () => {
     state.connected = false;
-    pushFeed("Connection lost. Refresh to reconnect.");
+    pushFeed("Game server unavailable. Check the multiplayer server URL.");
   });
 
   ws.addEventListener("message", (event) => {
     const message = JSON.parse(event.data);
     handleServerMessage(message);
   });
+}
+
+function resolveGameServerUrl() {
+  const query = new URLSearchParams(location.search);
+  const requestedUrl = query.get("server");
+  if (requestedUrl) {
+    const normalized = normalizeWebSocketUrl(requestedUrl);
+    localStorage.setItem("ffaGameServerUrl", normalized);
+    return normalized;
+  }
+
+  const savedUrl = localStorage.getItem("ffaGameServerUrl");
+  if (savedUrl) return normalizeWebSocketUrl(savedUrl);
+
+  const protocol = location.protocol === "https:" ? "wss" : "ws";
+  return `${protocol}://${location.host}`;
+}
+
+function normalizeWebSocketUrl(value) {
+  const trimmed = String(value || "").trim().replace(/\/$/, "");
+  if (trimmed.startsWith("https://")) return `wss://${trimmed.slice(8)}`;
+  if (trimmed.startsWith("http://")) return `ws://${trimmed.slice(7)}`;
+  if (trimmed.startsWith("ws://") || trimmed.startsWith("wss://")) return trimmed;
+  return `wss://${trimmed}`;
 }
 
 function handleServerMessage(message) {
