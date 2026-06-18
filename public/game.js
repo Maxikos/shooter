@@ -23,6 +23,11 @@ const mapCtx = minimap.getContext("2d");
 const BASE_SPEED = 6.25;
 const NORMAL_FOV = 74;
 const SCOPE_FOV = 32;
+const BURST_SCOPE_FOV = 43;
+const ASSAULT_SCOPE_FOV = 50;
+const GRAVITY = 13;
+const JUMP_SPEED = 5.6;
+const SLIDE_DURATION = 750;
 const CHUNK_SIZE = 18;
 const PLAYER_HEIGHT = 1.7;
 const EYE_HEIGHT = 1.45;
@@ -125,6 +130,8 @@ const state = {
   offlineRevealAt: 0,
   offlineBotGoal: { x: 8, z: 8 },
   offlineBotThinkAt: 0,
+  offlineJumpHeld: false,
+  offlineSlideHeld: false,
   reconnectTimer: null,
   localPos: new THREE.Vector3(0, EYE_HEIGHT, 0)
 };
@@ -178,8 +185,8 @@ document.addEventListener("pointerlockchange", () => {
 document.addEventListener("mousemove", (event) => {
   if (!state.pointerLocked || !state.joined) return;
   const self = state.players.get(state.selfId);
-  const scoped = self && self.weapon === "sniper" && state.aiming;
-  const sensitivity = scoped ? 0.0009 : 0.0021;
+  const scoped = self && state.aiming;
+  const sensitivity = scoped ? (self.weapon === "sniper" ? 0.0009 : 0.00135) : 0.0021;
   state.yaw -= event.movementX * sensitivity;
   state.pitch -= event.movementY * sensitivity * 0.92;
   state.pitch = clamp(state.pitch, -1.22, 1.22);
@@ -439,6 +446,8 @@ function sendInput() {
     forward: (state.keys.has("keyw") ? 1 : 0) + (state.keys.has("keys") ? -1 : 0),
     strafe: (state.keys.has("keyd") ? 1 : 0) + (state.keys.has("keya") ? -1 : 0),
     shooting: state.shooting,
+    jump: state.keys.has("space"),
+    slide: state.keys.has("controlleft") || state.keys.has("controlright") || state.keys.has("keyc"),
     yaw: state.yaw,
     pitch: state.pitch,
     dir: rawDir,
@@ -500,7 +509,13 @@ function makeOfflinePlayer(id, name, isBot, x, z, weaponId) {
     isTrainingDummy: false,
     color: isBot ? "#f0b94b" : "#4cc9f0",
     x,
+    y: 0,
     z,
+    velocityY: 0,
+    sliding: false,
+    slideUntil: 0,
+    slideCooldownUntil: 0,
+    slideDir: { x: 0, z: -1 },
     renderX: x,
     renderZ: z,
     yaw: 0,
@@ -550,7 +565,7 @@ function moveOfflinePlayer(player, dt) {
   const forward = (state.keys.has("keyw") ? 1 : 0) + (state.keys.has("keys") ? -1 : 0);
   const strafe = (state.keys.has("keyd") ? 1 : 0) + (state.keys.has("keya") ? -1 : 0);
   const length = Math.hypot(forward, strafe);
-  if (!length) return;
+  const now = performance.now();
 
   getRawAimDirection(rayDir);
   const flatLength = Math.hypot(rayDir.x, rayDir.z) || 1;
@@ -559,8 +574,44 @@ function moveOfflinePlayer(player, dt) {
   const rx = -fz;
   const rz = fx;
   const speed = BASE_SPEED * LOCAL_WEAPONS[player.weapon].speed;
-  player.x += (fx * (forward / length) + rx * (strafe / length)) * speed * dt;
-  player.z += (fz * (forward / length) + rz * (strafe / length)) * speed * dt;
+  const f = length ? forward / length : 0;
+  const s = length ? strafe / length : 0;
+  const moveX = fx * f + rx * s;
+  const moveZ = fz * f + rz * s;
+
+  const jumpHeld = state.keys.has("space");
+  if (jumpHeld && !state.offlineJumpHeld && player.y <= 0.001 && now >= player.slideUntil) {
+    player.velocityY = JUMP_SPEED;
+    player.y = 0.01;
+  }
+  state.offlineJumpHeld = jumpHeld;
+
+  const slideHeld = state.keys.has("controlleft") || state.keys.has("controlright") || state.keys.has("keyc");
+  if (slideHeld && !state.offlineSlideHeld && player.y <= 0.001 && now >= player.slideCooldownUntil) {
+    const moveLength = Math.hypot(moveX, moveZ);
+    player.slideDir = moveLength > 0.01 ? { x: moveX / moveLength, z: moveZ / moveLength } : { x: fx, z: fz };
+    player.slideUntil = now + SLIDE_DURATION;
+    player.slideCooldownUntil = now + SLIDE_DURATION + 500;
+  }
+  state.offlineSlideHeld = slideHeld;
+  player.sliding = now < player.slideUntil && player.y <= 0.001;
+
+  if (player.sliding) {
+    const remaining = clamp((player.slideUntil - now) / SLIDE_DURATION, 0, 1);
+    const slideSpeed = lerp(speed * 1.05, speed * 1.75, remaining);
+    player.x += player.slideDir.x * slideSpeed * dt;
+    player.z += player.slideDir.z * slideSpeed * dt;
+  } else {
+    player.x += moveX * speed * dt;
+    player.z += moveZ * speed * dt;
+  }
+
+  player.velocityY -= GRAVITY * dt;
+  player.y += player.velocityY * dt;
+  if (player.y <= 0) {
+    player.y = 0;
+    player.velocityY = 0;
+  }
 
   const distance = Math.hypot(player.x, player.z);
   const limit = state.worldRadius - 2;
@@ -639,14 +690,15 @@ function resolveOfflineShot(weapon) {
   const self = state.players.get(state.selfId);
   if (!self) return;
   getAssistedAimDirection(rayDir);
-  const origin = new THREE.Vector3(self.x, EYE_HEIGHT, self.z);
+  const origin = new THREE.Vector3(self.x, self.y + (self.sliding ? 0.88 : EYE_HEIGHT), self.z);
   let closest = null;
 
   for (const target of state.players.values()) {
     if (target.id === self.id || target.hp <= 0) continue;
     const range = target.isTrainingDummy ? Math.max(weapon.range, 140) : weapon.range;
-    const headDistance = raySphereDistance(origin, rayDir, new THREE.Vector3(target.x, 1.52, target.z), 0.34, range);
-    const bodyDistance = raySphereDistance(origin, rayDir, new THREE.Vector3(target.x, 0.78, target.z), 0.62, range);
+    const crouchOffset = target.sliding ? -0.45 : 0;
+    const headDistance = raySphereDistance(origin, rayDir, new THREE.Vector3(target.x, target.y + crouchOffset + 1.52, target.z), 0.34, range);
+    const bodyDistance = raySphereDistance(origin, rayDir, new THREE.Vector3(target.x, target.y + crouchOffset + 0.78, target.z), 0.62, range);
     const distance = headDistance !== null && (bodyDistance === null || headDistance <= bodyDistance) ? headDistance : bodyDistance;
     if (distance === null || (closest && distance >= closest.distance)) continue;
     closest = { target, distance, headshot: distance === headDistance };
@@ -719,7 +771,7 @@ function findAimTarget(baseDir, mode = "assist") {
   const self = state.players.get(state.selfId);
   if (!self) return null;
 
-  const origin = new THREE.Vector3(self.x, EYE_HEIGHT, self.z);
+  const origin = new THREE.Vector3(self.x, (self.y || 0) + (self.sliding ? 0.88 : EYE_HEIGHT), self.z);
   const autoCone = lerp(0.88, 0.22, state.assistIntensity);
   const assistCone = lerp(0.985, 0.74, state.assistIntensity);
   const cone = mode === "auto" ? autoCone : assistCone;
@@ -727,7 +779,7 @@ function findAimTarget(baseDir, mode = "assist") {
 
   for (const player of state.players.values()) {
     if (player.id === state.selfId || player.hp <= 0) continue;
-    const targetY = player.isTrainingDummy ? 1.0 : 1.2;
+    const targetY = (player.y || 0) + (player.sliding ? 0.78 : player.isTrainingDummy ? 1.0 : 1.2);
     const toTarget = new THREE.Vector3(player.x, targetY, player.z).sub(origin);
     const distance = toTarget.length();
     if (distance < 0.1 || distance > 80) continue;
@@ -826,9 +878,14 @@ function update(dt) {
 
   const revealActive = Date.now() < state.revealUntil;
   revealPill.classList.toggle("active", revealActive);
-  const scoped = self && self.weapon === "sniper" && state.aiming && self.hp > 0;
+  const scoped = self && state.aiming && self.hp > 0;
   scopeOverlay.classList.toggle("active", Boolean(scoped));
-  camera.fov = lerp(camera.fov, scoped ? SCOPE_FOV : NORMAL_FOV, 1 - Math.pow(0.0003, dt));
+  const scopedFov = self && self.weapon === "sniper"
+    ? SCOPE_FOV
+    : self && self.weapon === "burst"
+      ? BURST_SCOPE_FOV
+      : ASSAULT_SCOPE_FOV;
+  camera.fov = lerp(camera.fov, scoped ? scopedFov : NORMAL_FOV, 1 - Math.pow(0.0003, dt));
   camera.updateProjectionMatrix();
 
   // Held-fire is scheduled server-side from input state so fast weapons do not skip shots between network messages.
@@ -861,7 +918,8 @@ function updateCamera(self, dt) {
   }
 
   if (!state.offline) predictLocalMovement(self, dt);
-  const target = tempVector.set(self.x, EYE_HEIGHT, self.z);
+  const eyeHeight = self.sliding ? 0.88 : EYE_HEIGHT;
+  const target = tempVector.set(self.x, (self.y || 0) + eyeHeight, self.z);
   state.localPos.lerp(target, 1 - Math.pow(0.00002, dt));
   camera.position.copy(state.localPos);
   camera.rotation.set(state.pitch, state.yaw, 0);
@@ -915,13 +973,15 @@ function updateRemotePlayers(dt, now) {
 
     player.renderX = lerp(player.renderX, player.x, 1 - Math.pow(0.02, dt));
     player.renderZ = lerp(player.renderZ, player.z, 1 - Math.pow(0.02, dt));
-    mesh.position.set(player.renderX, 0, player.renderZ);
+    mesh.position.set(player.renderX, player.y || 0, player.renderZ);
     mesh.rotation.y = player.yaw;
 
     const speed = Math.hypot(player.x - player.renderX, player.z - player.renderZ);
     const bob = Math.sin(now * 0.008 + id.length) * (speed > 0.02 ? 0.055 : 0.018);
-    mesh.userData.body.position.y = 0.74 + bob;
-    mesh.userData.head.position.y = 1.43 + bob * 0.5;
+    const crouchOffset = player.sliding ? -0.42 : 0;
+    mesh.userData.body.position.y = 0.74 + bob + crouchOffset;
+    mesh.userData.head.position.y = 1.43 + bob * 0.5 + crouchOffset;
+    mesh.userData.label.position.y = 2.02 + crouchOffset;
     mesh.userData.shadow.scale.setScalar(1 + Math.abs(bob) * 1.5);
 
     if (now - (player.lastHitAt || 0) < 160) {
@@ -947,7 +1007,7 @@ function updateWeapon(dt, self) {
   const kick = state.weaponKick;
   const reload = state.reloadAnim;
 
-  const scoped = self && self.weapon === "sniper" && state.aiming && self.hp > 0;
+  const scoped = self && state.aiming && self.hp > 0;
   weaponView.visible = !scoped;
   weaponView.position.set(0.32, -0.32 - reload * 0.18 + bob, -0.62 + kick * 0.16);
   weaponView.rotation.set(-0.08 - kick * 0.45 + reload * 0.52, -0.16 + kick * 0.06, 0.02 + reload * 0.6);
@@ -997,7 +1057,7 @@ function createPlayerMesh(player) {
 
   group.add(shadow, body, head, armL, armR, legL, legR, gun, label);
   group.userData = { body, head, shadow, label };
-  group.position.set(player.x, 0, player.z);
+  group.position.set(player.x, player.y || 0, player.z);
   playerRoot.add(group);
   return group;
 }
@@ -1063,29 +1123,42 @@ function buildWeaponView(weaponId) {
     return mesh;
   };
 
+  const addScope = (position, length, radius, material) => {
+    const scope = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, length, 16), material);
+    scope.rotation.z = Math.PI / 2;
+    scope.position.set(...position);
+    scope.castShadow = true;
+    weaponView.add(scope);
+    const lens = new THREE.Mesh(
+      new THREE.CylinderGeometry(radius * 0.78, radius * 0.78, 0.012, 16),
+      new THREE.MeshStandardMaterial({ color: 0x6cc7e8, emissive: 0x123c4a, roughness: 0.18, metalness: 0.08 })
+    );
+    lens.rotation.z = Math.PI / 2;
+    lens.position.set(position[0] + length / 2 + 0.008, position[1], position[2]);
+    weaponView.add(lens);
+  };
+
   if (weaponId === "assault") {
     addBox([0.72, 0.12, 0.16], [0, 0, 0], metal);
     addBox([0.28, 0.09, 0.15], [-0.38, -0.01, 0.02], dark);
     addBox([0.38, 0.055, 0.085], [0.55, 0.01, 0], accent);
     addBox([0.12, 0.34, 0.12], [0.06, -0.23, 0.02], dark, [0.18, 0, 0]);
     addBox([0.18, 0.28, 0.1], [-0.23, -0.18, 0.02], accent, [-0.25, 0, 0]);
+    addScope([0.08, 0.15, 0], 0.28, 0.055, dark);
   } else if (weaponId === "burst") {
     addBox([0.66, 0.13, 0.17], [0, 0, 0], accent);
     addBox([0.28, 0.1, 0.15], [-0.36, 0, 0.02], dark);
     addBox([0.36, 0.06, 0.08], [0.52, 0.02, 0], metal);
     addBox([0.12, 0.25, 0.1], [-0.02, -0.2, 0.03], dark, [0.18, 0, 0]);
     addBox([0.22, 0.05, 0.13], [0.08, 0.11, 0], dark);
+    addScope([0.12, 0.17, 0], 0.34, 0.065, dark);
   } else {
     addBox([0.9, 0.1, 0.13], [0.08, 0, 0], metal);
     addBox([0.46, 0.06, 0.07], [0.74, 0.02, 0], accent);
     addBox([0.3, 0.12, 0.14], [-0.38, 0.02, 0], dark);
     addBox([0.12, 0.32, 0.1], [-0.08, -0.22, 0.02], dark, [0.16, 0, 0]);
 
-    const scope = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.34, 16), accent);
-    scope.rotation.z = Math.PI / 2;
-    scope.position.set(0.14, 0.16, 0);
-    scope.castShadow = true;
-    weaponView.add(scope);
+    addScope([0.14, 0.16, 0], 0.34, 0.07, accent);
   }
 
   weaponView.position.set(0.32, -0.32, -0.62);

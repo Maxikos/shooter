@@ -10,6 +10,10 @@ const PUBLIC_DIR = path.join(__dirname, "public");
 const TICK_RATE = 60;
 const STATE_RATE = 30;
 const BASE_SPEED = 6.25;
+const GRAVITY = 13;
+const JUMP_SPEED = 5.6;
+const SLIDE_DURATION = 750;
+const STALE_PLAYER_TIMEOUT = 15000;
 const WORLD_SEED = Math.floor(Math.random() * 1_000_000_000);
 
 const WEAPONS = {
@@ -127,7 +131,12 @@ function makePlayer(id, name, weaponId, isBot = false) {
     isBot,
     color: isBot ? "#f0b94b" : randomColor(),
     x: spawn.x,
+    y: 0,
     z: spawn.z,
+    velocityY: 0,
+    slideUntil: 0,
+    slideCooldownUntil: 0,
+    slideDir: { x: 0, z: -1 },
     yaw: Math.random() * Math.PI * 2,
     pitch: 0,
     hp: 100,
@@ -138,7 +147,7 @@ function makePlayer(id, name, weaponId, isBot = false) {
     reloadUntil: 0,
     nextFireAt: 0,
     deadUntil: 0,
-    input: { forward: 0, strafe: 0, shooting: false, dir: { x: 0, y: 0, z: -1 }, shotDir: { x: 0, y: 0, z: -1 } },
+    input: { forward: 0, strafe: 0, shooting: false, jumpHeld: false, jumpQueued: false, slideHeld: false, slideQueued: false, dir: { x: 0, y: 0, z: -1 }, shotDir: { x: 0, y: 0, z: -1 } },
     lastInputAt: Date.now()
   };
 }
@@ -280,12 +289,16 @@ function receiveSocketData(client, chunk) {
 function disconnectClient(id) {
   const client = clients.get(id);
   if (!client) return;
+  const player = players.get(id);
   clients.delete(id);
   players.delete(id);
   try {
     client.socket.destroy();
   } catch {
     // Socket is already closed.
+  }
+  if (player && !player.isBot) {
+    broadcast({ type: "feed", text: `${player.name} left the fight.` });
   }
 }
 
@@ -311,6 +324,12 @@ function handleMessage(client, message) {
     player.input.forward = clamp(Number(message.forward) || 0, -1, 1);
     player.input.strafe = clamp(Number(message.strafe) || 0, -1, 1);
     player.input.shooting = Boolean(message.shooting);
+    const jumpHeld = Boolean(message.jump);
+    const slideHeld = Boolean(message.slide);
+    if (jumpHeld && !player.input.jumpHeld) player.input.jumpQueued = true;
+    if (slideHeld && !player.input.slideHeld) player.input.slideQueued = true;
+    player.input.jumpHeld = jumpHeld;
+    player.input.slideHeld = slideHeld;
     player.yaw = Number.isFinite(message.yaw) ? Number(message.yaw) : player.yaw;
     player.pitch = clamp(Number(message.pitch) || 0, -1.35, 1.35);
     player.input.dir = normalizeDir(message.dir, player.yaw, player.pitch);
@@ -409,6 +428,10 @@ function tick() {
   updateBot(now, dt, radius);
 
   for (const player of players.values()) {
+    if (!player.isBot && now - player.lastInputAt > STALE_PLAYER_TIMEOUT) {
+      disconnectClient(player.id);
+      continue;
+    }
     const weapon = WEAPONS[player.weapon];
 
     if (player.hp <= 0) {
@@ -422,7 +445,7 @@ function tick() {
     }
 
     if (!player.isBot) {
-      movePlayer(player, dt, radius);
+      movePlayer(player, dt, radius, now);
       if (player.input.shooting) {
         tryFire(player, now, player.input.shotDir, true);
       }
@@ -432,7 +455,7 @@ function tick() {
   flushPendingShots(now);
 }
 
-function movePlayer(player, dt, radius) {
+function movePlayer(player, dt, radius, now) {
   const weapon = WEAPONS[player.weapon];
   const speed = BASE_SPEED * (weapon ? weapon.speed : 1);
   const forward = clamp(player.input.forward, -1, 1);
@@ -447,11 +470,45 @@ function movePlayer(player, dt, radius) {
   const fz = aim.z / flatLength;
   const rx = -fz;
   const rz = fx;
-  const dx = (fx * f + rx * s) * speed * dt;
-  const dz = (fz * f + rz * s) * speed * dt;
+
+  if (player.input.jumpQueued && player.y <= 0.001 && now >= player.slideUntil) {
+    player.velocityY = JUMP_SPEED;
+    player.y = 0.01;
+  }
+  player.input.jumpQueued = false;
+
+  const moveX = fx * f + rx * s;
+  const moveZ = fz * f + rz * s;
+  if (player.input.slideQueued && player.y <= 0.001 && now >= player.slideCooldownUntil) {
+    const moveLength = Math.hypot(moveX, moveZ);
+    player.slideDir = moveLength > 0.01
+      ? { x: moveX / moveLength, z: moveZ / moveLength }
+      : { x: fx, z: fz };
+    player.slideUntil = now + SLIDE_DURATION;
+    player.slideCooldownUntil = now + SLIDE_DURATION + 500;
+  }
+  player.input.slideQueued = false;
+
+  let dx;
+  let dz;
+  if (now < player.slideUntil && player.y <= 0.001) {
+    const remaining = clamp((player.slideUntil - now) / SLIDE_DURATION, 0, 1);
+    const slideSpeed = lerp(speed * 1.05, speed * 1.75, remaining);
+    dx = player.slideDir.x * slideSpeed * dt;
+    dz = player.slideDir.z * slideSpeed * dt;
+  } else {
+    dx = moveX * speed * dt;
+    dz = moveZ * speed * dt;
+  }
 
   player.x += dx;
   player.z += dz;
+  player.velocityY -= GRAVITY * dt;
+  player.y += player.velocityY * dt;
+  if (player.y <= 0) {
+    player.y = 0;
+    player.velocityY = 0;
+  }
   clampToWorld(player, radius);
 }
 
@@ -499,7 +556,8 @@ function flushPendingShots(now) {
 }
 
 function resolveShot(shooter, weapon, dir) {
-  const origin = { x: shooter.x, y: 1.45, z: shooter.z };
+  const eyeHeight = Date.now() < shooter.slideUntil ? 0.88 : 1.45;
+  const origin = { x: shooter.x, y: shooter.y + eyeHeight, z: shooter.z };
   let closest = null;
 
   for (const target of players.values()) {
@@ -574,8 +632,10 @@ function calculateDamage(weapon, distance, headshot) {
 }
 
 function intersectPlayer(origin, dir, target, range) {
-  const head = raySphere(origin, dir, { x: target.x, y: 1.52, z: target.z }, 0.34, range);
-  const body = rayCylinder(origin, dir, { x: target.x, z: target.z }, 0.48, 0.08, 1.28, range);
+  const crouchOffset = Date.now() < target.slideUntil ? -0.45 : 0;
+  const baseY = target.y + crouchOffset;
+  const head = raySphere(origin, dir, { x: target.x, y: baseY + 1.52, z: target.z }, 0.34, range);
+  const body = rayCylinder(origin, dir, { x: target.x, z: target.z }, 0.48, baseY + 0.08, baseY + 1.28, range);
 
   if (head && (!body || head.distance <= body.distance)) {
     return { ...head, part: "head" };
@@ -637,6 +697,9 @@ function respawn(player) {
     player.x = spawn.x;
     player.z = spawn.z;
   }
+  player.y = 0;
+  player.velocityY = 0;
+  player.slideUntil = 0;
   player.hp = player.maxHp || 100;
   player.ammo = weapon.magazine;
   player.reloadUntil = 0;
@@ -664,6 +727,7 @@ function serializePlayer(player) {
     isTrainingDummy: Boolean(player.isTrainingDummy),
     color: player.color,
     x: Math.round(player.x * 100) / 100,
+    y: Math.round(player.y * 100) / 100,
     z: Math.round(player.z * 100) / 100,
     yaw: Math.round(player.yaw * 1000) / 1000,
     pitch: Math.round(player.pitch * 1000) / 1000,
@@ -676,7 +740,8 @@ function serializePlayer(player) {
     magazine: weapon.magazine,
     reloading: player.reloadUntil > Date.now(),
     reloadEnd: player.reloadUntil,
-    deadUntil: player.deadUntil
+    deadUntil: player.deadUntil,
+    sliding: player.slideUntil > Date.now()
   };
 }
 
