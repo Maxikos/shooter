@@ -26,6 +26,7 @@ const SCOPE_FOV = 32;
 const CHUNK_SIZE = 18;
 const PLAYER_HEIGHT = 1.7;
 const EYE_HEIGHT = 1.45;
+const DEPLOYED_GAME_SERVER_URL = "wss://ffa-guns-server.onrender.com";
 const LOCAL_WEAPONS = {
   assault: { id: "assault", damage: 8, cooldown: 0.1, magazine: 15, reload: 1.34, headshot: 1.5, speed: 0.9, range: 30, dropStart: 10, dropDamageStart: 7.9, dropDamageEnd: 2, burst: 1, burstGap: 0 },
   burst: { id: "burst", damage: 14, cooldown: 0.6, magazine: 12, reload: 0.92, headshot: 1, speed: 0.95, range: 45, dropStart: 15, dropDamageStart: 13.9, dropDamageEnd: 3.5, burst: 3, burstGap: 0.15 },
@@ -124,6 +125,7 @@ const state = {
   offlineRevealAt: 0,
   offlineBotGoal: { x: 8, z: 8 },
   offlineBotThinkAt: 0,
+  reconnectTimer: null,
   localPos: new THREE.Vector3(0, EYE_HEIGHT, 0)
 };
 
@@ -258,13 +260,29 @@ function connect() {
 
   ws.addEventListener("open", () => {
     state.connected = true;
+    if (state.reconnectTimer) {
+      clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = null;
+    }
     pushFeed("Connected to arena.");
+    if (state.pendingJoin || (state.offline && state.joined)) sendJoinRequest();
   });
 
   ws.addEventListener("close", () => {
     state.connected = false;
-    state.offline = true;
-    if (state.pendingJoin && !state.joined) startOfflineMatch();
+    if (state.joined && !state.offline) {
+      state.joined = false;
+      state.pendingJoin = true;
+      startOfflineMatch();
+    } else if (state.pendingJoin && !state.joined) {
+      startOfflineMatch();
+    }
+    if (!state.reconnectTimer) {
+      state.reconnectTimer = setTimeout(() => {
+        state.reconnectTimer = null;
+        connect();
+      }, 3000);
+    }
   });
 
   ws.addEventListener("message", (event) => {
@@ -284,6 +302,8 @@ function resolveGameServerUrl() {
 
   const savedUrl = localStorage.getItem("ffaGameServerUrl");
   if (savedUrl) return normalizeWebSocketUrl(savedUrl);
+
+  if (location.hostname.endsWith("vercel.app")) return DEPLOYED_GAME_SERVER_URL;
 
   const protocol = location.protocol === "https:" ? "wss" : "ws";
   return `${protocol}://${location.host}`;
@@ -306,6 +326,9 @@ function handleServerMessage(message) {
   }
 
   if (message.type === "joined") {
+    const wasOffline = state.offline;
+    state.offline = false;
+    state.pendingJoin = false;
     state.selfId = message.id;
     state.seed = message.seed || state.seed;
     state.worldRadius = message.worldRadius || state.worldRadius;
@@ -314,6 +337,10 @@ function handleServerMessage(message) {
     hud.classList.remove("hidden");
     requestPointerLockSafe();
     rebuildWorld();
+    if (wasOffline) {
+      state.offlineShots.length = 0;
+      pushFeed("Multiplayer connection restored.");
+    }
     return;
   }
 
@@ -358,14 +385,21 @@ function joinGame() {
   buildWeaponView(state.selectedWeapon);
   state.pendingJoin = true;
   if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
-    startOfflineMatch();
+    setTimeout(() => {
+      if (!state.connected && !state.joined) startOfflineMatch();
+    }, 2500);
     return;
   }
-  send({
+  sendJoinRequest();
+}
+
+function sendJoinRequest() {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  state.ws.send(JSON.stringify({
     type: "join",
     name: playerNameInput.value || "",
     weapon: state.selectedWeapon
-  });
+  }));
 }
 
 function send(message) {
@@ -426,7 +460,7 @@ function startOfflineMatch() {
   if (state.joined) return;
   state.offline = true;
   state.joined = true;
-  state.pendingJoin = false;
+  state.pendingJoin = true;
   state.selfId = "offline-player";
   state.weaponDefs = LOCAL_WEAPONS;
   state.worldRadius = 52;
