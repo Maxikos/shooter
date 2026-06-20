@@ -121,6 +121,7 @@ const state = {
   feed: [],
   tracers: [],
   lastStateAt: 0,
+  serverTimeOffset: 0,
   startedAt: performance.now(),
   weaponKick: 0,
   reloadAnim: 0,
@@ -132,6 +133,18 @@ const state = {
   offlineBotThinkAt: 0,
   offlineJumpHeld: false,
   offlineSlideHeld: false,
+  predictionInitialized: false,
+  predictedY: 0,
+  predictedVelocityY: 0,
+  predictedSliding: false,
+  predictedSlideUntil: 0,
+  predictedSlideCooldownUntil: 0,
+  predictedSlideDir: { x: 0, z: -1 },
+  predictionJumpHeld: false,
+  predictionSlideHeld: false,
+  hitmarkerTimer: null,
+  localNextFireAt: 0,
+  localVisualShots: [],
   reconnectTimer: null,
   localPos: new THREE.Vector3(0, EYE_HEIGHT, 0)
 };
@@ -245,6 +258,7 @@ document.addEventListener("mousedown", (event) => {
   }
   if (event.button !== 0) return;
   state.shooting = true;
+  if (!state.offline) tryLocalVisualFire(performance.now());
   sendShot();
 });
 
@@ -253,7 +267,7 @@ document.addEventListener("mouseup", (event) => {
   if (event.button === 0) state.shooting = false;
 });
 
-setInterval(sendInput, 1000 / 30);
+setInterval(sendInput, 1000 / 60);
 
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.05);
@@ -336,6 +350,9 @@ function handleServerMessage(message) {
     const wasOffline = state.offline;
     state.offline = false;
     state.pendingJoin = false;
+    state.predictionInitialized = false;
+    state.localNextFireAt = 0;
+    state.localVisualShots.length = 0;
     state.selfId = message.id;
     state.seed = message.seed || state.seed;
     state.worldRadius = message.worldRadius || state.worldRadius;
@@ -353,6 +370,7 @@ function handleServerMessage(message) {
 
   if (message.type === "state") {
     state.lastStateAt = performance.now();
+    state.serverTimeOffset = lerp(state.serverTimeOffset, (message.time || Date.now()) - Date.now(), 0.15);
     state.seed = message.seed || state.seed;
     if (Math.abs((message.worldRadius || state.worldRadius) - state.worldRadius) > 0.5) {
       state.worldRadius = message.worldRadius;
@@ -451,7 +469,8 @@ function sendInput() {
     yaw: state.yaw,
     pitch: state.pitch,
     dir: rawDir,
-    shotDir: { x: rayDir.x, y: rayDir.y, z: rayDir.z }
+    shotDir: { x: rayDir.x, y: rayDir.y, z: rayDir.z },
+    shotTime: Date.now() + state.serverTimeOffset
   });
 }
 
@@ -462,7 +481,11 @@ function sendShot() {
     return;
   }
   getAssistedAimDirection(rayDir);
-  send({ type: "shoot", dir: { x: rayDir.x, y: rayDir.y, z: rayDir.z } });
+  send({
+    type: "shoot",
+    dir: { x: rayDir.x, y: rayDir.y, z: rayDir.z },
+    shotTime: Date.now() + state.serverTimeOffset
+  });
 }
 
 function startOfflineMatch() {
@@ -869,6 +892,10 @@ function update(dt) {
   const self = state.players.get(state.selfId);
 
   if (state.offline) updateOfflineGame(dt, now);
+  if (!state.offline && self) {
+    if (state.shooting) tryLocalVisualFire(now);
+    processLocalVisualShots(now);
+  }
   updateAutoAim(self, dt);
   updateCamera(self, dt);
   updateRemotePlayers(dt, now);
@@ -888,7 +915,57 @@ function update(dt) {
   camera.fov = lerp(camera.fov, scoped ? scopedFov : NORMAL_FOV, 1 - Math.pow(0.0003, dt));
   camera.updateProjectionMatrix();
 
-  // Held-fire is scheduled server-side from input state so fast weapons do not skip shots between network messages.
+  // Damage stays server-authoritative; these local effects remove round-trip delay from the weapon feel.
+}
+
+function tryLocalVisualFire(now) {
+  const self = state.players.get(state.selfId);
+  const weapon = self && state.weaponDefs[self.weapon];
+  if (!self || !weapon || self.hp <= 0 || self.reloading || self.ammo <= 0 || now < state.localNextFireAt) return;
+
+  state.localNextFireAt = now + weapon.cooldown * 1000;
+  const shots = Math.min(weapon.burst || 1, self.ammo);
+  for (let i = 0; i < shots; i += 1) {
+    state.localVisualShots.push({
+      due: now + (weapon.burstGap || 0) * 1000 * i,
+      weapon: weapon.id
+    });
+  }
+}
+
+function processLocalVisualShots(now) {
+  state.localVisualShots.sort((a, b) => a.due - b.due);
+  while (state.localVisualShots.length && state.localVisualShots[0].due <= now) {
+    const shot = state.localVisualShots.shift();
+    playLocalShotEffect(shot.weapon);
+  }
+}
+
+function playLocalShotEffect(weaponId) {
+  const self = state.players.get(state.selfId);
+  const weapon = state.weaponDefs[weaponId];
+  if (!self || !weapon) return;
+
+  getAssistedAimDirection(rayDir);
+  const origin = camera.position.clone();
+  let distance = Math.min(weapon.range, 70);
+  for (const target of state.players.values()) {
+    if (target.id === self.id || target.hp <= 0) continue;
+    const x = Number.isFinite(target.renderX) ? target.renderX : target.x;
+    const z = Number.isFinite(target.renderZ) ? target.renderZ : target.z;
+    const crouchOffset = target.sliding ? -0.45 : 0;
+    const headDistance = raySphereDistance(origin, rayDir, new THREE.Vector3(x, target.y + crouchOffset + 1.52, z), 0.34, weapon.range);
+    const bodyDistance = raySphereDistance(origin, rayDir, new THREE.Vector3(x, target.y + crouchOffset + 0.78, z), 0.62, weapon.range);
+    const targetDistance = headDistance !== null && (bodyDistance === null || headDistance <= bodyDistance) ? headDistance : bodyDistance;
+    if (targetDistance !== null && targetDistance < distance) distance = targetDistance;
+  }
+
+  const to = origin.clone().add(rayDir.clone().multiplyScalar(distance));
+  const tracer = createTracer(origin, to, 0xf4e3a2, weaponId);
+  tracerRoot.add(tracer);
+  state.tracers.push(tracer);
+  state.weaponKick = 1;
+  playShot(weaponId);
 }
 
 function updateAutoAim(self, dt) {
@@ -918,8 +995,10 @@ function updateCamera(self, dt) {
   }
 
   if (!state.offline) predictLocalMovement(self, dt);
-  const eyeHeight = self.sliding ? 0.88 : EYE_HEIGHT;
-  const target = tempVector.set(self.x, (self.y || 0) + eyeHeight, self.z);
+  const localSliding = state.offline ? self.sliding : state.predictedSliding;
+  const localY = state.offline ? (self.y || 0) : state.predictedY;
+  const eyeHeight = localSliding ? 0.88 : EYE_HEIGHT;
+  const target = tempVector.set(self.x, localY + eyeHeight, self.z);
   state.localPos.lerp(target, 1 - Math.pow(0.00002, dt));
   camera.position.copy(state.localPos);
   camera.rotation.set(state.pitch, state.yaw, 0);
@@ -936,23 +1015,74 @@ function updateCamera(self, dt) {
 
 function predictLocalMovement(self, dt) {
   if (!self || self.hp <= 0) return;
+  const now = performance.now();
+  if (!state.predictionInitialized) {
+    state.predictionInitialized = true;
+    state.predictedY = self.y || 0;
+    state.predictedVelocityY = 0;
+    state.predictedSliding = Boolean(self.sliding);
+    state.localPos.set(self.x, state.predictedY + (self.sliding ? 0.88 : EYE_HEIGHT), self.z);
+  }
+
   const forward = (state.keys.has("keyw") ? 1 : 0) + (state.keys.has("keys") ? -1 : 0);
   const strafe = (state.keys.has("keyd") ? 1 : 0) + (state.keys.has("keya") ? -1 : 0);
   const length = Math.hypot(forward, strafe);
-  if (!length) return;
 
   const weapon = state.weaponDefs[self.weapon];
   const speed = BASE_SPEED * (weapon ? weapon.speed : 1);
-  const f = forward / length;
-  const s = strafe / length;
+  const f = length ? forward / length : 0;
+  const s = length ? strafe / length : 0;
   getAimDirection(rayDir);
   const flatLength = Math.hypot(rayDir.x, rayDir.z) || 1;
   const fx = rayDir.x / flatLength;
   const fz = rayDir.z / flatLength;
   const rx = -fz;
   const rz = fx;
-  state.localPos.x += (fx * f + rx * s) * speed * dt;
-  state.localPos.z += (fz * f + rz * s) * speed * dt;
+  const moveX = fx * f + rx * s;
+  const moveZ = fz * f + rz * s;
+
+  const jumpHeld = state.keys.has("space");
+  if (jumpHeld && !state.predictionJumpHeld && state.predictedY <= 0.001 && now >= state.predictedSlideUntil) {
+    state.predictedVelocityY = JUMP_SPEED;
+    state.predictedY = 0.01;
+  }
+  state.predictionJumpHeld = jumpHeld;
+
+  const slideHeld = state.keys.has("controlleft") || state.keys.has("controlright") || state.keys.has("keyc");
+  if (slideHeld && !state.predictionSlideHeld && state.predictedY <= 0.001 && now >= state.predictedSlideCooldownUntil) {
+    const moveLength = Math.hypot(moveX, moveZ);
+    state.predictedSlideDir = moveLength > 0.01 ? { x: moveX / moveLength, z: moveZ / moveLength } : { x: fx, z: fz };
+    state.predictedSlideUntil = now + SLIDE_DURATION;
+    state.predictedSlideCooldownUntil = now + SLIDE_DURATION + 500;
+  }
+  state.predictionSlideHeld = slideHeld;
+  state.predictedSliding = now < state.predictedSlideUntil && state.predictedY <= 0.001;
+
+  if (state.predictedSliding) {
+    const remaining = clamp((state.predictedSlideUntil - now) / SLIDE_DURATION, 0, 1);
+    const slideSpeed = lerp(speed * 1.05, speed * 1.75, remaining);
+    state.localPos.x += state.predictedSlideDir.x * slideSpeed * dt;
+    state.localPos.z += state.predictedSlideDir.z * slideSpeed * dt;
+  } else if (length) {
+    state.localPos.x += moveX * speed * dt;
+    state.localPos.z += moveZ * speed * dt;
+  }
+
+  state.predictedVelocityY -= GRAVITY * dt;
+  state.predictedY += state.predictedVelocityY * dt;
+  if (state.predictedY <= 0) {
+    state.predictedY = 0;
+    state.predictedVelocityY = 0;
+  }
+
+  const serverY = self.y || 0;
+  if (Math.abs(serverY - state.predictedY) > 0.08) {
+    state.predictedY = lerp(state.predictedY, serverY, 1 - Math.pow(0.08, dt));
+  }
+  if (self.sliding && !state.predictedSliding && state.predictedY <= 0.001) {
+    state.predictedSlideUntil = Math.max(state.predictedSlideUntil, now + 120);
+    state.predictedSliding = true;
+  }
 
   const distance = Math.hypot(state.localPos.x, state.localPos.z);
   const limit = Math.max(4, state.worldRadius - 2);
@@ -1169,16 +1299,21 @@ function buildWeaponView(weaponId) {
 function onShot(message) {
   const from = new THREE.Vector3(message.from.x, message.from.y, message.from.z);
   const to = new THREE.Vector3(message.to.x, message.to.y, message.to.z);
-  const color = message.hit ? (message.headshot ? 0xfff3a1 : 0xff6f7d) : 0xf4e3a2;
-  const tracer = createTracer(from, to, color, message.weapon);
-  tracerRoot.add(tracer);
-  state.tracers.push(tracer);
+  const locallyPredicted = !state.offline && message.shooterId === state.selfId;
+  if (!locallyPredicted) {
+    const color = message.hit ? (message.headshot ? 0xfff3a1 : 0xff6f7d) : 0xf4e3a2;
+    const tracer = createTracer(from, to, color, message.weapon);
+    tracerRoot.add(tracer);
+    state.tracers.push(tracer);
+  }
 
   if (message.shooterId === state.selfId) {
-    state.weaponKick = 1;
-    playShot(message.weapon);
+    if (!locallyPredicted) {
+      state.weaponKick = 1;
+      playShot(message.weapon);
+    }
     if (message.hit) {
-      flashHitmarker(message.headshot);
+      flashHitmarker(message.headshot, message.damage);
       playHit(message.headshot);
     }
   } else {
@@ -1220,10 +1355,17 @@ function updateTracers(dt) {
   }
 }
 
-function flashHitmarker(headshot) {
-  hitmarker.textContent = headshot ? "X" : "x";
+function flashHitmarker(headshot, damage) {
+  const amount = Number.isFinite(Number(damage))
+    ? Number(Number(damage).toFixed(1)).toString()
+    : "HIT";
+  hitmarker.textContent = headshot ? `${amount} HEAD` : `-${amount}`;
+  hitmarker.classList.toggle("headshot", Boolean(headshot));
+  clearTimeout(state.hitmarkerTimer);
+  hitmarker.classList.remove("active");
+  void hitmarker.offsetWidth;
   hitmarker.classList.add("active");
-  setTimeout(() => hitmarker.classList.remove("active"), 115);
+  state.hitmarkerTimer = setTimeout(() => hitmarker.classList.remove("active"), 240);
 }
 
 function drawMinimap() {

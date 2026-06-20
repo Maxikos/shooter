@@ -8,13 +8,14 @@ const path = require("path");
 const PORT = Number(process.env.PORT || 3000);
 const PUBLIC_DIR = path.join(__dirname, "public");
 const TICK_RATE = 60;
-const STATE_RATE = 30;
+const STATE_RATE = 60;
 const BASE_SPEED = 6.25;
 const GRAVITY = 13;
 const JUMP_SPEED = 5.6;
 const SLIDE_DURATION = 750;
 const STALE_PLAYER_TIMEOUT = 15000;
 const WORLD_SEED = Math.floor(Math.random() * 1_000_000_000);
+const SERVER_VERSION = "2026-06-20-lag-comp-v1";
 
 const WEAPONS = {
   assault: {
@@ -137,6 +138,7 @@ function makePlayer(id, name, weaponId, isBot = false) {
     slideUntil: 0,
     slideCooldownUntil: 0,
     slideDir: { x: 0, z: -1 },
+    history: [],
     yaw: Math.random() * Math.PI * 2,
     pitch: 0,
     hp: 100,
@@ -147,7 +149,7 @@ function makePlayer(id, name, weaponId, isBot = false) {
     reloadUntil: 0,
     nextFireAt: 0,
     deadUntil: 0,
-    input: { forward: 0, strafe: 0, shooting: false, jumpHeld: false, jumpQueued: false, slideHeld: false, slideQueued: false, dir: { x: 0, y: 0, z: -1 }, shotDir: { x: 0, y: 0, z: -1 } },
+    input: { forward: 0, strafe: 0, shooting: false, jumpHeld: false, jumpQueued: false, slideHeld: false, slideQueued: false, shotTime: Date.now(), dir: { x: 0, y: 0, z: -1 }, shotDir: { x: 0, y: 0, z: -1 } },
     lastInputAt: Date.now()
   };
 }
@@ -223,6 +225,7 @@ server.on("upgrade", (req, socket) => {
     "",
     ""
   ].join("\r\n"));
+  socket.setNoDelay(true);
 
   const id = randomId("p");
   const client = { id, socket, buffer: Buffer.alloc(0), joined: false };
@@ -312,7 +315,7 @@ function handleMessage(client, message) {
     const player = makePlayer(client.id, name, weapon, false);
     players.set(client.id, player);
     client.joined = true;
-    send(client, { type: "joined", id: client.id, seed: WORLD_SEED, worldRadius: worldRadius() });
+    send(client, { type: "joined", id: client.id, seed: WORLD_SEED, worldRadius: worldRadius(), serverVersion: SERVER_VERSION });
     broadcast({ type: "feed", text: `${player.name} joined the fight.` });
     return;
   }
@@ -334,13 +337,17 @@ function handleMessage(client, message) {
     player.pitch = clamp(Number(message.pitch) || 0, -1.35, 1.35);
     player.input.dir = normalizeDir(message.dir, player.yaw, player.pitch);
     player.input.shotDir = normalizeDir(message.shotDir || message.dir, player.yaw, player.pitch);
-    player.lastInputAt = Date.now();
+    const now = Date.now();
+    player.input.shotTime = clamp(Number(message.shotTime) || now, now - 750, now + 50);
+    player.lastInputAt = now;
     return;
   }
 
   if (message.type === "shoot") {
     player.input.shotDir = normalizeDir(message.dir, player.yaw, player.pitch);
-    tryFire(player, Date.now(), player.input.shotDir);
+    const now = Date.now();
+    const shotTime = clamp(Number(message.shotTime) || now, now - 750, now + 50);
+    tryFire(player, now, player.input.shotDir, false, shotTime);
     return;
   }
 
@@ -371,7 +378,7 @@ function startReload(player, now) {
   broadcast({ type: "reload", id: player.id, weapon: weapon.id });
 }
 
-function tryFire(player, now, dir, catchUp = false) {
+function tryFire(player, now, dir, catchUp = false, shotTime = now) {
   const weapon = WEAPONS[player.weapon];
   if (!weapon || player.hp <= 0 || player.deadUntil > now) return;
 
@@ -392,7 +399,7 @@ function tryFire(player, now, dir, catchUp = false) {
 
   while (queuedShots < maxQueuedShots && now >= player.nextFireAt) {
     const fireAt = catchUp && player.nextFireAt > 0 ? player.nextFireAt : now;
-    queueWeaponShot(player, weapon, dir, fireAt);
+    queueWeaponShot(player, weapon, dir, fireAt, shotTime);
     queuedShots += 1;
 
     if (player.ammo <= 0) {
@@ -403,7 +410,7 @@ function tryFire(player, now, dir, catchUp = false) {
   }
 }
 
-function queueWeaponShot(player, weapon, dir, fireAt) {
+function queueWeaponShot(player, weapon, dir, fireAt, shotTime) {
   const shots = Math.min(weapon.burst, player.ammo);
   player.ammo -= shots;
   player.nextFireAt = fireAt + weapon.cooldown * 1000;
@@ -414,6 +421,7 @@ function queueWeaponShot(player, weapon, dir, fireAt) {
       shooterId: player.id,
       weaponId: weapon.id,
       dir: { ...dir },
+      shotTime: shotTime + weapon.burstGap * 1000 * i,
       dynamicAim: weapon.burst > 1 && i > 0
     });
   }
@@ -447,11 +455,12 @@ function tick() {
     if (!player.isBot) {
       movePlayer(player, dt, radius, now);
       if (player.input.shooting) {
-        tryFire(player, now, player.input.shotDir, true);
+        tryFire(player, now, player.input.shotDir, true, player.input.shotTime);
       }
     }
   }
 
+  recordPlayerHistory(now);
   flushPendingShots(now);
 }
 
@@ -543,6 +552,48 @@ function clampToWorld(player, radius) {
   }
 }
 
+function recordPlayerHistory(now) {
+  for (const player of players.values()) {
+    player.history.push({
+      time: now,
+      x: player.x,
+      y: player.y,
+      z: player.z,
+      sliding: now < player.slideUntil
+    });
+    while (player.history.length > 2 && player.history[0].time < now - 1000) {
+      player.history.shift();
+    }
+  }
+}
+
+function historicalPlayerState(player, requestedTime) {
+  const history = player.history;
+  if (!history || history.length < 2) {
+    return { x: player.x, y: player.y, z: player.z, sliding: Date.now() < player.slideUntil };
+  }
+
+  const time = clamp(requestedTime, history[0].time, history[history.length - 1].time);
+  let before = history[0];
+  let after = history[history.length - 1];
+  for (let i = 1; i < history.length; i += 1) {
+    if (history[i].time >= time) {
+      before = history[i - 1];
+      after = history[i];
+      break;
+    }
+  }
+
+  const span = after.time - before.time;
+  const t = span > 0 ? clamp((time - before.time) / span, 0, 1) : 0;
+  return {
+    x: lerp(before.x, after.x, t),
+    y: lerp(before.y, after.y, t),
+    z: lerp(before.z, after.z, t),
+    sliding: t < 0.5 ? before.sliding : after.sliding
+  };
+}
+
 function flushPendingShots(now) {
   pendingShots.sort((a, b) => a.fireAt - b.fireAt);
   while (pendingShots.length && pendingShots[0].fireAt <= now) {
@@ -551,19 +602,21 @@ function flushPendingShots(now) {
     const weapon = WEAPONS[shot.weaponId];
     if (!shooter || !weapon || shooter.hp <= 0) continue;
     const dir = shot.dynamicAim ? shooter.input.shotDir : shot.dir;
-    resolveShot(shooter, weapon, dir);
+    resolveShot(shooter, weapon, dir, Math.min(shot.shotTime || now, now));
   }
 }
 
-function resolveShot(shooter, weapon, dir) {
-  const eyeHeight = Date.now() < shooter.slideUntil ? 0.88 : 1.45;
-  const origin = { x: shooter.x, y: shooter.y + eyeHeight, z: shooter.z };
+function resolveShot(shooter, weapon, dir, shotTime = Date.now()) {
+  const shooterState = historicalPlayerState(shooter, shotTime);
+  const eyeHeight = shooterState.sliding ? 0.88 : 1.45;
+  const origin = { x: shooterState.x, y: shooterState.y + eyeHeight, z: shooterState.z };
   let closest = null;
 
   for (const target of players.values()) {
     if (target.id === shooter.id || target.hp <= 0) continue;
     const effectiveRange = target.isTrainingDummy ? Math.max(weapon.range, 140) : weapon.range;
-    const hit = intersectPlayer(origin, dir, target, effectiveRange);
+    const targetState = historicalPlayerState(target, shotTime);
+    const hit = intersectPlayer(origin, dir, targetState, effectiveRange);
     if (!hit) continue;
     if (!closest || hit.distance < closest.distance) {
       closest = { target, ...hit };
@@ -632,7 +685,7 @@ function calculateDamage(weapon, distance, headshot) {
 }
 
 function intersectPlayer(origin, dir, target, range) {
-  const crouchOffset = Date.now() < target.slideUntil ? -0.45 : 0;
+  const crouchOffset = target.sliding ? -0.45 : 0;
   const baseY = target.y + crouchOffset;
   const head = raySphere(origin, dir, { x: target.x, y: baseY + 1.52, z: target.z }, 0.34, range);
   const body = rayCylinder(origin, dir, { x: target.x, z: target.z }, 0.48, baseY + 0.08, baseY + 1.28, range);

@@ -344,11 +344,19 @@ h1 {
   left: 50%;
   top: 50%;
   color: #fff;
-  font-size: 28px;
+  min-width: 88px;
+  font-size: 20px;
   font-weight: 900;
+  text-align: center;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+  pointer-events: none;
   opacity: 0;
   transform: translate(-50%, -50%) scale(1.8);
   transition: opacity 120ms ease, transform 120ms ease;
+}
+
+#hitmarker.headshot {
+  color: #ffe27a;
 }
 
 #hitmarker.active {
