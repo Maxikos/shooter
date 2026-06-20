@@ -10,12 +10,12 @@ const PUBLIC_DIR = path.join(__dirname, "public");
 const TICK_RATE = 60;
 const STATE_RATE = 60;
 const BASE_SPEED = 6.25;
-const GRAVITY = 13;
-const JUMP_SPEED = 5.6;
+const GRAVITY = 15;
+const JUMP_SPEED = 8.2;
 const SLIDE_DURATION = 750;
 const STALE_PLAYER_TIMEOUT = 15000;
 const WORLD_SEED = Math.floor(Math.random() * 1_000_000_000);
-const SERVER_VERSION = "2026-06-20-lag-comp-v1";
+const SERVER_VERSION = "2026-06-20-shotgun-v1";
 
 const WEAPONS = {
   assault: {
@@ -31,6 +31,7 @@ const WEAPONS = {
     dropStart: 10,
     dropDamageStart: 7.9,
     dropDamageEnd: 2,
+    dropScale: 2.5,
     burst: 1,
     burstGap: 0
   },
@@ -47,6 +48,7 @@ const WEAPONS = {
     dropStart: 15,
     dropDamageStart: 13.9,
     dropDamageEnd: 3.5,
+    dropScale: 2.5,
     burst: 3,
     burstGap: 0.15
   },
@@ -63,8 +65,28 @@ const WEAPONS = {
     dropStart: null,
     dropDamageStart: null,
     dropDamageEnd: null,
+    dropScale: 1,
     burst: 1,
     burstGap: 0
+  },
+  shotgun: {
+    id: "shotgun",
+    name: "Shotgun",
+    damage: 60,
+    cooldown: 1,
+    magazine: 7,
+    reload: 1.3,
+    headshot: 1.7,
+    speed: 1,
+    range: 18,
+    dropStart: 3,
+    dropDamageStart: 60,
+    dropDamageEnd: 10,
+    dropScale: 1,
+    burst: 1,
+    burstGap: 0,
+    pellets: 8,
+    spread: 0.11
   }
 };
 
@@ -610,6 +632,10 @@ function resolveShot(shooter, weapon, dir, shotTime = Date.now()) {
   const shooterState = historicalPlayerState(shooter, shotTime);
   const eyeHeight = shooterState.sliding ? 0.88 : 1.45;
   const origin = { x: shooterState.x, y: shooterState.y + eyeHeight, z: shooterState.z };
+  if (weapon.pellets > 1) {
+    resolveShotgun(shooter, weapon, origin, dir, shotTime);
+    return;
+  }
   let closest = null;
 
   for (const target of players.values()) {
@@ -671,12 +697,120 @@ function resolveShot(shooter, weapon, dir, shotTime = Date.now()) {
   }
 }
 
+function resolveShotgun(shooter, weapon, origin, dir, shotTime) {
+  const hitsByTarget = new Map();
+  const pelletWeapon = {
+    ...weapon,
+    damage: weapon.damage / weapon.pellets,
+    dropDamageStart: weapon.dropDamageStart / weapon.pellets,
+    dropDamageEnd: weapon.dropDamageEnd / weapon.pellets
+  };
+
+  for (const pelletDir of shotgunDirections(dir, weapon.pellets, weapon.spread)) {
+    let closest = null;
+    for (const target of players.values()) {
+      if (target.id === shooter.id || target.hp <= 0) continue;
+      const targetState = historicalPlayerState(target, shotTime);
+      const hit = intersectPlayer(origin, pelletDir, targetState, weapon.range);
+      if (!hit || (closest && hit.distance >= closest.distance)) continue;
+      closest = { target, ...hit };
+    }
+    if (!closest) continue;
+
+    const headshot = closest.part === "head";
+    const damage = calculateDamage(pelletWeapon, closest.distance, headshot);
+    const existing = hitsByTarget.get(closest.target.id) || {
+      target: closest.target,
+      damage: 0,
+      headshot: false,
+      point: closest.point,
+      distance: closest.distance
+    };
+    existing.damage += damage;
+    existing.headshot ||= headshot;
+    if (closest.distance < existing.distance) {
+      existing.distance = closest.distance;
+      existing.point = closest.point;
+    }
+    hitsByTarget.set(closest.target.id, existing);
+  }
+
+  if (!hitsByTarget.size) {
+    broadcast({
+      type: "shot",
+      shooterId: shooter.id,
+      weapon: weapon.id,
+      from: origin,
+      to: { x: origin.x + dir.x * weapon.range, y: origin.y + dir.y * weapon.range, z: origin.z + dir.z * weapon.range },
+      hit: false
+    });
+    return;
+  }
+
+  for (const result of hitsByTarget.values()) {
+    const damage = Math.round(result.damage * 10) / 10;
+    const maxHp = result.target.maxHp || 100;
+    result.target.hp = clamp(result.target.hp - damage, 0, maxHp);
+    result.target.lastHitAt = Date.now();
+    result.target.lastHitPart = result.headshot ? "head" : "body";
+    broadcast({
+      type: "shot",
+      shooterId: shooter.id,
+      targetId: result.target.id,
+      weapon: weapon.id,
+      from: origin,
+      to: result.point,
+      hit: true,
+      headshot: result.headshot,
+      damage
+    });
+
+    if (result.target.hp <= 0) {
+      shooter.score += 1;
+      result.target.deaths += 1;
+      result.target.deadUntil = Date.now() + (result.target.isBot ? 1300 : 2800);
+      broadcast({ type: "feed", text: `${shooter.name} blasted ${result.target.name}.` });
+    }
+  }
+}
+
+function shotgunDirections(direction, pellets, spread) {
+  const forward = normalizeVector(direction);
+  const reference = Math.abs(forward.y) < 0.95 ? { x: 0, y: 1, z: 0 } : { x: 1, y: 0, z: 0 };
+  const right = normalizeVector(cross(forward, reference));
+  const up = normalizeVector(cross(right, forward));
+  const directions = [];
+  for (let i = 0; i < pellets; i += 1) {
+    const radius = spread * Math.sqrt((i + 0.35) / pellets);
+    const angle = i * 2.399963;
+    directions.push(normalizeVector({
+      x: forward.x + right.x * Math.cos(angle) * radius + up.x * Math.sin(angle) * radius,
+      y: forward.y + right.y * Math.cos(angle) * radius + up.y * Math.sin(angle) * radius,
+      z: forward.z + right.z * Math.cos(angle) * radius + up.z * Math.sin(angle) * radius
+    }));
+  }
+  return directions;
+}
+
+function normalizeVector(vector) {
+  const length = Math.hypot(vector.x, vector.y, vector.z) || 1;
+  return { x: vector.x / length, y: vector.y / length, z: vector.z / length };
+}
+
+function cross(a, b) {
+  return {
+    x: a.y * b.z - a.z * b.y,
+    y: a.z * b.x - a.x * b.z,
+    z: a.x * b.y - a.y * b.x
+  };
+}
+
 function calculateDamage(weapon, distance, headshot) {
   if (distance > weapon.range) return 0;
 
   let damage = weapon.damage;
   if (weapon.dropStart !== null && distance > weapon.dropStart) {
-    const t = clamp((distance - weapon.dropStart) / (weapon.range - weapon.dropStart), 0, 1);
+    const t = clamp(((distance - weapon.dropStart) / (weapon.range - weapon.dropStart)) * (weapon.dropScale || 1), 0, 1);
     damage = lerp(weapon.dropDamageStart, weapon.dropDamageEnd, t);
   }
 

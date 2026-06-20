@@ -12,7 +12,7 @@ const scoreboardEl = document.querySelector("#scoreboard");
 const feedEl = document.querySelector("#feed");
 const minimap = document.querySelector("#minimap");
 const resumeButton = document.querySelector("#resume");
-const hitmarker = document.querySelector("#hitmarker");
+const hitmarkers = document.querySelector("#hitmarkers");
 const damageVignette = document.querySelector("#damage-vignette");
 const scopeOverlay = document.querySelector("#scope");
 const aimAssistInput = document.querySelector("#aim-assist");
@@ -25,17 +25,18 @@ const NORMAL_FOV = 74;
 const SCOPE_FOV = 32;
 const BURST_SCOPE_FOV = 43;
 const ASSAULT_SCOPE_FOV = 50;
-const GRAVITY = 13;
-const JUMP_SPEED = 5.6;
+const GRAVITY = 15;
+const JUMP_SPEED = 8.2;
 const SLIDE_DURATION = 750;
 const CHUNK_SIZE = 18;
 const PLAYER_HEIGHT = 1.7;
 const EYE_HEIGHT = 1.45;
 const DEPLOYED_GAME_SERVER_URL = "wss://ffa-guns-server.onrender.com";
 const LOCAL_WEAPONS = {
-  assault: { id: "assault", damage: 8, cooldown: 0.1, magazine: 15, reload: 1.34, headshot: 1.5, speed: 0.9, range: 30, dropStart: 10, dropDamageStart: 7.9, dropDamageEnd: 2, burst: 1, burstGap: 0 },
-  burst: { id: "burst", damage: 14, cooldown: 0.6, magazine: 12, reload: 0.92, headshot: 1, speed: 0.95, range: 45, dropStart: 15, dropDamageStart: 13.9, dropDamageEnd: 3.5, burst: 3, burstGap: 0.15 },
-  sniper: { id: "sniper", damage: 40, cooldown: 1.6, magazine: 4, reload: 2.5, headshot: 2.5, speed: 1, range: 120, dropStart: null, dropDamageStart: null, dropDamageEnd: null, burst: 1, burstGap: 0 }
+  assault: { id: "assault", damage: 8, cooldown: 0.1, magazine: 15, reload: 1.34, headshot: 1.5, speed: 0.9, range: 30, dropStart: 10, dropDamageStart: 7.9, dropDamageEnd: 2, dropScale: 2.5, burst: 1, burstGap: 0 },
+  burst: { id: "burst", damage: 14, cooldown: 0.6, magazine: 12, reload: 0.92, headshot: 1, speed: 0.95, range: 45, dropStart: 15, dropDamageStart: 13.9, dropDamageEnd: 3.5, dropScale: 2.5, burst: 3, burstGap: 0.15 },
+  sniper: { id: "sniper", damage: 40, cooldown: 1.6, magazine: 4, reload: 2.5, headshot: 2.5, speed: 1, range: 120, dropStart: null, dropDamageStart: null, dropDamageEnd: null, dropScale: 1, burst: 1, burstGap: 0 },
+  shotgun: { id: "shotgun", damage: 60, cooldown: 1, magazine: 7, reload: 1.3, headshot: 1.7, speed: 1, range: 18, dropStart: 3, dropDamageStart: 60, dropDamageEnd: 10, dropScale: 1, burst: 1, burstGap: 0, pellets: 8, spread: 0.11 }
 };
 
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
@@ -142,7 +143,7 @@ const state = {
   predictedSlideDir: { x: 0, z: -1 },
   predictionJumpHeld: false,
   predictionSlideHeld: false,
-  hitmarkerTimer: null,
+  hitmarkerSequence: 0,
   localNextFireAt: 0,
   localVisualShots: [],
   reconnectTimer: null,
@@ -198,7 +199,7 @@ document.addEventListener("pointerlockchange", () => {
 document.addEventListener("mousemove", (event) => {
   if (!state.pointerLocked || !state.joined) return;
   const self = state.players.get(state.selfId);
-  const scoped = self && state.aiming;
+  const scoped = self && state.aiming && self.weapon !== "shotgun";
   const sensitivity = scoped ? (self.weapon === "sniper" ? 0.0009 : 0.00135) : 0.0021;
   state.yaw -= event.movementX * sensitivity;
   state.pitch -= event.movementY * sensitivity * 0.92;
@@ -714,6 +715,10 @@ function resolveOfflineShot(weapon) {
   if (!self) return;
   getAssistedAimDirection(rayDir);
   const origin = new THREE.Vector3(self.x, self.y + (self.sliding ? 0.88 : EYE_HEIGHT), self.z);
+  if (weapon.pellets > 1) {
+    resolveOfflineShotgun(weapon, self, origin, rayDir.clone());
+    return;
+  }
   let closest = null;
 
   for (const target of state.players.values()) {
@@ -748,6 +753,64 @@ function resolveOfflineShot(weapon) {
   }
 }
 
+function resolveOfflineShotgun(weapon, self, origin, direction) {
+  let bestTarget = null;
+  let totalDamage = 0;
+  let anyHeadshot = false;
+  const pelletWeapon = { ...weapon, damage: weapon.damage / weapon.pellets, dropDamageStart: weapon.dropDamageStart / weapon.pellets, dropDamageEnd: weapon.dropDamageEnd / weapon.pellets };
+
+  for (const pelletDir of makeShotgunDirections(direction, weapon.pellets, weapon.spread)) {
+    let closest = null;
+    for (const target of state.players.values()) {
+      if (target.id === self.id || target.hp <= 0) continue;
+      const headDistance = raySphereDistance(origin, pelletDir, new THREE.Vector3(target.x, target.y + 1.52, target.z), 0.34, weapon.range);
+      const bodyDistance = raySphereDistance(origin, pelletDir, new THREE.Vector3(target.x, target.y + 0.78, target.z), 0.62, weapon.range);
+      const distance = headDistance !== null && (bodyDistance === null || headDistance <= bodyDistance) ? headDistance : bodyDistance;
+      if (distance === null || (closest && distance >= closest.distance)) continue;
+      closest = { target, distance, headshot: distance === headDistance };
+    }
+    if (!closest || (bestTarget && closest.target.id !== bestTarget.id)) continue;
+    if (!bestTarget) bestTarget = closest.target;
+    totalDamage += calculateOfflineDamage(pelletWeapon, closest.distance, closest.headshot);
+    anyHeadshot ||= closest.headshot;
+  }
+
+  if (!bestTarget || totalDamage <= 0) {
+    const to = origin.clone().add(direction.multiplyScalar(weapon.range));
+    onShot({ type: "shot", shooterId: self.id, weapon: weapon.id, from: origin, to, hit: false });
+    return;
+  }
+
+  totalDamage = Math.round(totalDamage * 10) / 10;
+  bestTarget.hp = clamp(bestTarget.hp - totalDamage, 0, bestTarget.maxHp);
+  bestTarget.lastHitAt = performance.now();
+  const to = new THREE.Vector3(bestTarget.x, bestTarget.y + 0.8, bestTarget.z);
+  onShot({ type: "shot", shooterId: self.id, targetId: bestTarget.id, weapon: weapon.id, from: origin, to, hit: true, headshot: anyHeadshot, damage: totalDamage });
+  if (bestTarget.hp <= 0) {
+    self.score += 1;
+    bestTarget.deaths += 1;
+    bestTarget.deadUntil = Date.now() + 1300;
+    pushFeed(`${self.name} eliminated ${bestTarget.name}.`);
+  }
+}
+
+function makeShotgunDirections(direction, pellets, spread) {
+  const forward = direction.clone().normalize();
+  const reference = Math.abs(forward.y) < 0.95 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+  const right = new THREE.Vector3().crossVectors(forward, reference).normalize();
+  const up = new THREE.Vector3().crossVectors(right, forward).normalize();
+  const directions = [];
+  for (let i = 0; i < pellets; i += 1) {
+    const radius = spread * Math.sqrt((i + 0.35) / pellets);
+    const angle = i * 2.399963;
+    directions.push(forward.clone()
+      .addScaledVector(right, Math.cos(angle) * radius)
+      .addScaledVector(up, Math.sin(angle) * radius)
+      .normalize());
+  }
+  return directions;
+}
+
 function raySphereDistance(origin, direction, center, radius, range) {
   const offset = origin.clone().sub(center);
   const b = offset.dot(direction);
@@ -762,7 +825,7 @@ function raySphereDistance(origin, direction, center, radius, range) {
 function calculateOfflineDamage(weapon, distance, headshot) {
   let damage = weapon.damage;
   if (weapon.dropStart !== null && distance > weapon.dropStart) {
-    const t = clamp((distance - weapon.dropStart) / (weapon.range - weapon.dropStart), 0, 1);
+    const t = clamp(((distance - weapon.dropStart) / (weapon.range - weapon.dropStart)) * (weapon.dropScale || 1), 0, 1);
     damage = lerp(weapon.dropDamageStart, weapon.dropDamageEnd, t);
   }
   if (headshot) damage *= weapon.headshot;
@@ -905,7 +968,7 @@ function update(dt) {
 
   const revealActive = Date.now() < state.revealUntil;
   revealPill.classList.toggle("active", revealActive);
-  const scoped = self && state.aiming && self.hp > 0;
+  const scoped = self && state.aiming && self.weapon !== "shotgun" && self.hp > 0;
   scopeOverlay.classList.toggle("active", Boolean(scoped));
   const scopedFov = self && self.weapon === "sniper"
     ? SCOPE_FOV
@@ -1137,7 +1200,7 @@ function updateWeapon(dt, self) {
   const kick = state.weaponKick;
   const reload = state.reloadAnim;
 
-  const scoped = self && state.aiming && self.hp > 0;
+  const scoped = self && state.aiming && self.weapon !== "shotgun" && self.hp > 0;
   weaponView.visible = !scoped;
   weaponView.position.set(0.32, -0.32 - reload * 0.18 + bob, -0.62 + kick * 0.16);
   weaponView.rotation.set(-0.08 - kick * 0.45 + reload * 0.52, -0.16 + kick * 0.06, 0.02 + reload * 0.6);
@@ -1242,7 +1305,7 @@ function buildWeaponView(weaponId) {
   weaponView = new THREE.Group();
   const metal = new THREE.MeshStandardMaterial({ color: 0x2e3733, roughness: 0.58, metalness: 0.25 });
   const dark = new THREE.MeshStandardMaterial({ color: 0x121817, roughness: 0.7, metalness: 0.12 });
-  const accent = new THREE.MeshStandardMaterial({ color: weaponId === "burst" ? 0x9ad1bb : weaponId === "sniper" ? 0xc3d9e8 : 0xd3c39a, roughness: 0.52, metalness: 0.18 });
+  const accent = new THREE.MeshStandardMaterial({ color: weaponId === "burst" ? 0x9ad1bb : weaponId === "sniper" ? 0xc3d9e8 : weaponId === "shotgun" ? 0xd6b36a : 0xd3c39a, roughness: 0.52, metalness: 0.18 });
 
   const addBox = (size, pos, mat, rot = [0, 0, 0]) => {
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(...size), mat);
@@ -1282,6 +1345,12 @@ function buildWeaponView(weaponId) {
     addBox([0.12, 0.25, 0.1], [-0.02, -0.2, 0.03], dark, [0.18, 0, 0]);
     addBox([0.22, 0.05, 0.13], [0.08, 0.11, 0], dark);
     addScope([0.12, 0.17, 0], 0.34, 0.065, dark);
+  } else if (weaponId === "shotgun") {
+    addBox([0.76, 0.13, 0.17], [0.02, 0, 0], metal);
+    addBox([0.48, 0.065, 0.075], [0.61, 0.025, 0], dark);
+    addBox([0.32, 0.105, 0.15], [-0.43, -0.015, 0], accent);
+    addBox([0.3, 0.13, 0.18], [0.3, -0.025, 0], accent);
+    addBox([0.12, 0.3, 0.11], [-0.17, -0.22, 0.02], dark, [0.2, 0, 0]);
   } else {
     addBox([0.9, 0.1, 0.13], [0.08, 0, 0], metal);
     addBox([0.46, 0.06, 0.07], [0.74, 0.02, 0], accent);
@@ -1324,7 +1393,7 @@ function onShot(message) {
 function createTracer(from, to, color, weapon) {
   const direction = to.clone().sub(from);
   const length = Math.max(0.01, direction.length());
-  const radius = weapon === "sniper" ? 0.045 : weapon === "burst" ? 0.034 : 0.028;
+  const radius = weapon === "sniper" ? 0.045 : weapon === "shotgun" ? 0.05 : weapon === "burst" ? 0.034 : 0.028;
   const geometry = new THREE.CylinderGeometry(radius, radius * 0.55, length, 8, 1, true);
   const material = new THREE.MeshBasicMaterial({
     color,
@@ -1359,13 +1428,14 @@ function flashHitmarker(headshot, damage) {
   const amount = Number.isFinite(Number(damage))
     ? Number(Number(damage).toFixed(1)).toString()
     : "HIT";
-  hitmarker.textContent = headshot ? `${amount} HEAD` : `-${amount}`;
-  hitmarker.classList.toggle("headshot", Boolean(headshot));
-  clearTimeout(state.hitmarkerTimer);
-  hitmarker.classList.remove("active");
-  void hitmarker.offsetWidth;
-  hitmarker.classList.add("active");
-  state.hitmarkerTimer = setTimeout(() => hitmarker.classList.remove("active"), 240);
+  const marker = document.createElement("div");
+  const sequence = state.hitmarkerSequence++;
+  marker.className = `damage-hitmarker${headshot ? " headshot" : ""}`;
+  marker.textContent = headshot ? `${amount} HEAD` : `-${amount}`;
+  marker.style.setProperty("--hit-x", `${((sequence % 5) - 2) * 18}px`);
+  marker.style.setProperty("--hit-y", `${-18 - (sequence % 4) * 19}px`);
+  hitmarkers.appendChild(marker);
+  setTimeout(() => marker.remove(), 560);
 }
 
 function drawMinimap() {
@@ -1630,6 +1700,9 @@ function playShot(weapon) {
   } else if (weapon === "burst") {
     makeNoise(0.08, 1050, 0.28);
     tone(160, 0.08, 0.09, "square", 0.7);
+  } else if (weapon === "shotgun") {
+    makeNoise(0.14, 720, 0.38);
+    tone(104, 0.14, 0.13, "sawtooth", 0.48);
   } else {
     makeNoise(0.055, 1250, 0.24);
     tone(210, 0.045, 0.055, "square", 0.64);
@@ -1640,7 +1713,7 @@ function playDistantShot(weapon, from) {
   const distance = camera.position.distanceTo(from);
   if (distance > 65) return;
   const volume = clamp(1 - distance / 70, 0.08, 0.5);
-  if (weapon === "sniper") {
+  if (weapon === "sniper" || weapon === "shotgun") {
     makeNoise(0.15, 420, 0.22 * volume);
   } else {
     makeNoise(0.06, 850, 0.16 * volume);
